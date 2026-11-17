@@ -25,21 +25,32 @@
 //      raw log-ratio is used instead: the early dip is nearly the same for
 //      every launch, while the shape there is dominated by how big the
 //      peak is.
-//   3. UNLOCK-JUMP BOOST (v3): the centre is lifted by +0.20 log units
-//      at hours 5-8, the US unlock window (US East midnight EDT at hour 5,
-//      US West midnight PDT at hour 8). The median comparable's shape
-//      systematically under-states the US unlock jump for big Western
-//      launches: all four practice cases under-predict hours 5-8, by
-//      +0.27 to +0.39 log units at the worst hours, and the boost is a
-//      flat plateau at 0.15-0.20 (0.1290 at both), not a sharp optimum.
-//      It is a Western-blockbuster correction, not a universal one: on
+//   3. UNLOCK-JUMP BOOST (v4): the centre is lifted by a RAISED-COSINE
+//      bump during the US unlock window, height 0.24 log units, centred
+//      at hour 6.5 with half-width 2.5 hours (so hours 5-8 get
+//      0.083 / 0.217 / 0.217 / 0.083, hours 4 and 9 get 0). The median
+//      comparable's shape systematically under-states the US unlock jump
+//      for big Western launches: all four practice cases under-predict
+//      hours 5-8, by +0.27 to +0.39 log units at the worst hours. The
+//      flat 0.20 plateau of v3 helped, but the cosine profile fits the
+//      jump's rise and fall better (practice 0.1249 vs v3's 0.1290) and
+//      holds up on a bigger validation set (see below). It is a
+//      Western-blockbuster correction, not a universal one: on
 //      comparable-LOO it helps the two biggest targets (ELDEN RING,
-//      Cyberpunk 2077) and hurts mid-size ones, so it is kept flat and
-//      small rather than scaled with launch size.
+//      Cyberpunk 2077) and hurts mid-size ones, so it is kept small
+//      rather than scaled with launch size.
+//   4. EARLY-DIP CORRECTION (v4): the centre is lowered by 0.10 log
+//      units at hours 3-4. The raw/shape median over-states the early
+//      dip for the biggest launches (their hour-3/4 prints sit above
+//      the median shape); the correction removes a systematic
+//      over-prediction there. It is small and was validated together
+//      with the cosine boost, not alone.
 // Quantiles are the median plus a normal spread that widens like a random
-// walk, sigma = 0.09 * sqrt(h - 1) in log units, ASYMMETRIC: the spread
-// below the median is 0.7x (viewers can only fall so far; the early dip is
-// bounded) and 1.0x above it (evening spikes are unbounded).
+// walk, sigma = 0.08 * sqrt(h - 1) in log units, ASYMMETRIC: the spread
+// below the median is 0.8x (viewers can only fall so far; the early dip is
+// bounded) and 1.0x above it (evening spikes are unbounded). The narrower
+// spread (v3 used 0.09 / 0.7) matches the tighter residuals once the
+// cosine boost and the early-dip correction are in.
 //
 // What is left out, and why:
 //   - Early-access launches (their day-1 curve already peaked days before
@@ -68,15 +79,31 @@
 //   - Streams / categories_hourly are null in practice, so the model works
 //     without them and ignores them when present.
 //
-// Local practice score (4 cases, pinball loss on the log scale): 0.129
-// overall vs v2's 0.135 and the house baseline's 0.387 (p00 0.126,
-// p01 0.087, p02 0.090, p03 0.214). Leave-one-out over the practice cases
-// (hyperparameters tuned on 3, tested on the 4th): 0.131 vs v2's 0.139.
+// Local practice score (4 cases, pinball loss on the log scale): 0.1249
+// overall vs v3's 0.1290 and the house baseline's 0.387 (p00 0.120,
+// p01 0.095, p02 0.083, p03 0.202). Honest 72-point leave-one-out over
+// the practice cases (hyperparameters tuned on 3, tested on the 4th):
+// 0.1305 vs v3's 0.1312 — a 0.0007 gain on 4 cases alone, which is noise.
+// That is why v4 was only adopted after a BIGGER validation set: 10
+// additional big launches fetched from SullyGnome's published "Average
+// viewers" per hour (Sekiro, God of War, Death Stranding, Horizon
+// Forbidden West, Pokemon Legends: Arceus, Star Wars Jedi: Survivor,
+// Final Fantasy XVI, Lies of P, Donkey Kong Bananza, Pokemon Legends:
+// Z-A — all with hour-1 prints >= 20k and complete 24-hour release
+// days), scored with the same pinball scorer. On that set v4 scores
+// 0.1567 vs v3's 0.1636 (margin +0.0069, winning 9 of 10 cases), and on
+// the combined 14 cases 0.1476 vs 0.1537 (margin +0.0061). The win
+// holds at every set size tried (7, 8, 10 cases: margins +0.0060,
+// +0.0063, +0.0069), so it is not a 4-case artefact. The two other
+// v5 candidates did not clear the bar on the bigger set (shaped boost
+// +0.0017, flat boost + neg34 +0.0010 on the new set) and were rejected.
+// The TypeScript port reproduces the Python reference numbers exactly:
+// identical outputs on all 14 cases (practice + validation), loss
+// differences 0.000000, two runs byte-identical, ~0.8 s for 10 cases.
 // Comparable-LOO (targets with hour-1 above 20k): 0.356 vs v2's 0.343 —
 // the boost is a big-Western-launch correction, and GTA VI is the biggest
 // Western launch there is. Practice is no guide to the final, but it is
-// the only signal available before submitting, and the boost sits on a
-// flat optimum (0.1290 at both 0.15 and 0.20), not a sharp one.
+// the only signal available before submitting.
 //
 // Node 22, standard library only, no network, deterministic: no random
 // numbers, no clock reads, same input always writes the same bytes.
@@ -96,17 +123,19 @@ const SLOPE_SHRINK = 0.75;
 /** The predicted log peak ratio never goes below this. */
 const PEAK_FLOOR = -0.6;
 /** Spread of an hour's move, in log units per square-root hour. */
-const SIGMA = 0.09;
+const SIGMA = 0.08;
 /** Spread multiplier below the median (the early dip is bounded). */
-const DOWN_MULT = 0.7;
+const DOWN_MULT = 0.8;
 /** Hours below this one use the raw log-ratio median, not peak + shape. */
 const RAW_BELOW_HOUR = 3;
-/** Lift added to the centre during the US unlock window (hours 5-8). */
-const JUMP_BOOST = 0.2;
-/** First hour of the US unlock window (US East midnight EDT). */
-const JUMP_FIRST_HOUR = 5;
-/** Last hour of the US unlock window (US West midnight PDT). */
-const JUMP_LAST_HOUR = 8;
+/** Height of the raised-cosine unlock-jump bump, in log units. */
+const JUMP_HEIGHT = 0.24;
+/** Centre hour of the raised-cosine unlock-jump bump. */
+const JUMP_CENTRE = 6.5;
+/** Half-width of the raised-cosine unlock-jump bump, in hours. */
+const JUMP_HALF_WIDTH = 2.5;
+/** Correction added to the centre at hours 3-4 (the early dip). */
+const EARLY_DIP_CORRECTION = -0.1;
 
 type Levels = number[];
 
@@ -216,8 +245,9 @@ function kernelWeight(logV1: number, targetLogV1: number): number {
 /**
  * The forecast of one case: the predicted peak from the local-linear fit,
  * the per-hour shape as the kernel-weighted median of (curve - peak), the
- * raw median for the earliest hours, the unlock-jump boost at hours 5-8,
- * widened by the asymmetric random-walk spread.
+ * raw median for the earliest hours, the raised-cosine unlock-jump bump
+ * at hours 5-8, the early-dip correction at hours 3-4, widened by the
+ * asymmetric random-walk spread.
  */
 function forecastCase(c: CaseInput): { hour: number; q: number[] }[] {
   const first = c.known.find((k) => k.hour === 1);
@@ -278,14 +308,20 @@ function forecastCase(c: CaseInput): { hour: number; q: number[] }[] {
       support = pairs.length;
       centre = peak + weightedMedian(pairs);
     }
-    // The US unlock window: the median comparable understates how hard
-    // the US unlocks hit for a big Western launch, so lift the centre
-    // there. Hours 5-8 only; the early hours and the evening peak are
-    // untouched. The boost is a property of the case, not of the
-    // comparables, so it is added AFTER the sparse-support shrink below:
-    // a thinly supported hour still gets the full unlock lift.
+    // The early dip is over-stated by the median shape for the biggest
+    // launches, so lower the centre at hours 3-4. And the US unlock
+    // window: the median comparable understates how hard the US unlocks
+    // hit for a big Western launch, so lift the centre there with a
+    // raised-cosine bump (0 at hours 4 and 9, peaking at hours 6-7).
+    // Both corrections are properties of the case, not of the
+    // comparables, so they are added AFTER the sparse-support shrink
+    // below: a thinly supported hour still gets the full corrections.
     if (support > 0 && support < 3) centre *= support / 3;
-    if (hour >= JUMP_FIRST_HOUR && hour <= JUMP_LAST_HOUR) centre += JUMP_BOOST;
+    if (hour === 3 || hour === 4) centre += EARLY_DIP_CORRECTION;
+    const jumpDistance = Math.abs(hour - JUMP_CENTRE);
+    if (jumpDistance <= JUMP_HALF_WIDTH) {
+      centre += JUMP_HEIGHT * 0.5 * (1 + Math.cos((Math.PI * (hour - JUMP_CENTRE)) / JUMP_HALF_WIDTH));
+    }
     // A centre over very few curves is noise, not signal: with fewer than
     // three comparables supplying this hour, blend it toward persistence
     // in proportion. In the practice cases every hour has all curves, so
