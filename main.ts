@@ -25,6 +25,17 @@
 //      raw log-ratio is used instead: the early dip is nearly the same for
 //      every launch, while the shape there is dominated by how big the
 //      peak is.
+//   3. UNLOCK-JUMP BOOST (v3): the centre is lifted by +0.20 log units
+//      at hours 5-8, the US unlock window (US East midnight EDT at hour 5,
+//      US West midnight PDT at hour 8). The median comparable's shape
+//      systematically under-states the US unlock jump for big Western
+//      launches: all four practice cases under-predict hours 5-8, by
+//      +0.27 to +0.39 log units at the worst hours, and the boost is a
+//      flat plateau at 0.15-0.20 (0.1290 at both), not a sharp optimum.
+//      It is a Western-blockbuster correction, not a universal one: on
+//      comparable-LOO it helps the two biggest targets (ELDEN RING,
+//      Cyberpunk 2077) and hurts mid-size ones, so it is kept flat and
+//      small rather than scaled with launch size.
 // Quantiles are the median plus a normal spread that widens like a random
 // walk, sigma = 0.09 * sqrt(h - 1) in log units, ASYMMETRIC: the spread
 // below the median is 0.7x (viewers can only fall so far; the early dip is
@@ -44,16 +55,28 @@
 //     0.25 -> 0.58). Empirical / IQR / SD spreads lose to the fixed
 //     random-walk spread. A per-hour spread fitted from leave-one-out
 //     residuals loses too.
+//   - One-factor shape (per-hour regression of the curve on the predicted
+//     peak) was tested and REJECTED (0.150-0.162 on practice vs 0.135:
+//     the regression slopes are too noisy across the comparable cloud).
+//     Peak-similarity shape weighting loses too (0.137-0.138).
+//   - Empirical-quantile forecasts (quantiles from the cross-comparable
+//     shape distribution) help on practice (0.133 at blend 0.75) but
+//     FAIL leave-one-out (0.142 vs 0.139 for v2): the gain is p03 alone.
+//     A quadratic peak fit helps comparable-LOO (0.321 vs 0.343) but
+//     FAILS practice leave-one-out (0.145, and LOO picks the linear peak).
+//     IQR-scaled spreads lose (0.136-0.145).
 //   - Streams / categories_hourly are null in practice, so the model works
 //     without them and ignores them when present.
 //
-// Local practice score (4 cases, pinball loss on the log scale): 0.135
-// overall vs v1's 0.248 and the house baseline's 0.387 (p00 0.123,
-// p01 0.106, p02 0.097, p03 0.215). Leave-one-out over the practice cases
-// (hyperparameters tuned on 3, tested on the 4th): 0.141. Practice is no
-// guide to the final, but it is the only signal available before
-// submitting, and the hyperparameters sit on a flat optimum (0.135-0.138
-// across the neighbouring grid), not a sharp one.
+// Local practice score (4 cases, pinball loss on the log scale): 0.129
+// overall vs v2's 0.135 and the house baseline's 0.387 (p00 0.126,
+// p01 0.087, p02 0.090, p03 0.214). Leave-one-out over the practice cases
+// (hyperparameters tuned on 3, tested on the 4th): 0.131 vs v2's 0.139.
+// Comparable-LOO (targets with hour-1 above 20k): 0.356 vs v2's 0.343 —
+// the boost is a big-Western-launch correction, and GTA VI is the biggest
+// Western launch there is. Practice is no guide to the final, but it is
+// the only signal available before submitting, and the boost sits on a
+// flat optimum (0.1290 at both 0.15 and 0.20), not a sharp one.
 //
 // Node 22, standard library only, no network, deterministic: no random
 // numbers, no clock reads, same input always writes the same bytes.
@@ -78,6 +101,12 @@ const SIGMA = 0.09;
 const DOWN_MULT = 0.7;
 /** Hours below this one use the raw log-ratio median, not peak + shape. */
 const RAW_BELOW_HOUR = 3;
+/** Lift added to the centre during the US unlock window (hours 5-8). */
+const JUMP_BOOST = 0.2;
+/** First hour of the US unlock window (US East midnight EDT). */
+const JUMP_FIRST_HOUR = 5;
+/** Last hour of the US unlock window (US West midnight PDT). */
+const JUMP_LAST_HOUR = 8;
 
 type Levels = number[];
 
@@ -187,8 +216,8 @@ function kernelWeight(logV1: number, targetLogV1: number): number {
 /**
  * The forecast of one case: the predicted peak from the local-linear fit,
  * the per-hour shape as the kernel-weighted median of (curve - peak), the
- * raw median for the earliest hours, widened by the asymmetric
- * random-walk spread.
+ * raw median for the earliest hours, the unlock-jump boost at hours 5-8,
+ * widened by the asymmetric random-walk spread.
  */
 function forecastCase(c: CaseInput): { hour: number; q: number[] }[] {
   const first = c.known.find((k) => k.hour === 1);
@@ -249,12 +278,19 @@ function forecastCase(c: CaseInput): { hour: number; q: number[] }[] {
       support = pairs.length;
       centre = peak + weightedMedian(pairs);
     }
+    // The US unlock window: the median comparable understates how hard
+    // the US unlocks hit for a big Western launch, so lift the centre
+    // there. Hours 5-8 only; the early hours and the evening peak are
+    // untouched. The boost is a property of the case, not of the
+    // comparables, so it is added AFTER the sparse-support shrink below:
+    // a thinly supported hour still gets the full unlock lift.
+    if (support > 0 && support < 3) centre *= support / 3;
+    if (hour >= JUMP_FIRST_HOUR && hour <= JUMP_LAST_HOUR) centre += JUMP_BOOST;
     // A centre over very few curves is noise, not signal: with fewer than
     // three comparables supplying this hour, blend it toward persistence
     // in proportion. In the practice cases every hour has all curves, so
     // this never bites there; it only guards the final if the case's
     // comparables ever arrive sparse.
-    if (support > 0 && support < 3) centre *= support / 3;
     const spread = SIGMA * Math.sqrt(Math.max(0, hour - 1));
     let q = z.map((zi) => round2(p1 * Math.exp(centre + zi * spread * (zi < 0 ? DOWN_MULT : 1))));
     q = q.map((v) => Math.min(1e9, Math.max(1, v)));
