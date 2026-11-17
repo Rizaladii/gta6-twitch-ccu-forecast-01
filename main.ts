@@ -2,35 +2,58 @@
 //
 // Method: the forecast is RELATIVE to hour 1's print, never absolute. Every
 // comparable launch in the case is reduced to its launch-day curve in log
-// space, ln(viewers_h / viewers_1) for h = 2..24, and each hour's median
-// log-ratio across the comparables is the shape of the day: a dip in the
-// small hours (only the early timezones have unlocked), a jump when the US
-// east coast unlocks, then a climb into the US evening peak and a late
-// fall. The median is shrunk 10% toward persistence (flat at hour 1) as a
-// hedge: a launch whose first hour is already huge has a flatter day than
-// the median comparable. Quantiles are the median plus a normal spread that
-// widens like a random walk, sigma = 0.15 * sqrt(h - 1) in log units.
+// space, ln(viewers_h / viewers_1) for h = 2..24. The day's shape is
+// governed by one number, the log PEAK ratio (the largest log-ratio over
+// hours 2..24): across launches the peak falls steeply with launch size
+// (tiny launches peak 100x their first hour, launches above 100k viewers
+// peak about 1.5x), and the SHAPE (curve minus peak) is far more stable
+// across launches than the raw curve, especially near the evening peak.
+//
+// The forecast is therefore built in two parts per case:
+//   1. PEAK: a kernel-weighted local-linear fit of the log peak ratio on
+//      ln(hour-1 viewers) across the usable comparables (Gaussian kernel,
+//      bandwidth 0.9 in log units, plus a small floor weight so the
+//      estimate never collapses to one neighbour). The fitted slope is
+//      clamped to [-1.5, 0] and shrunk 25% toward 0: the peak falls with
+//      scale, but a straight global line through the tiny-game cloud would
+//      extrapolate to an absurdly flat day for a huge launch, so the local
+//      fit and the shrink keep it honest. The peak is floored at -0.6:
+//      even the biggest launch on record peaked at its first hour, never
+//      far below it.
+//   2. SHAPE: per hour, the kernel-weighted median of (curve_h - peak)
+//      across the comparables, added to the predicted peak. For hour 2 the
+//      raw log-ratio is used instead: the early dip is nearly the same for
+//      every launch, while the shape there is dominated by how big the
+//      peak is.
+// Quantiles are the median plus a normal spread that widens like a random
+// walk, sigma = 0.09 * sqrt(h - 1) in log units, ASYMMETRIC: the spread
+// below the median is 0.7x (viewers can only fall so far; the early dip is
+// bounded) and 1.0x above it (evening spikes are unbounded).
 //
 // What is left out, and why:
 //   - Early-access launches (their day-1 curve already peaked days before
-//     the release day, so their shape is not a launch shape) and "weak"
-//     comparables (free-to-play / live-service launches, not a one-day
-//     event) are excluded by their unlock notes.
-//   - The Grand Theft Auto VI category's own pre-release history is not a
-//     launch curve, so it is excluded by name.
-//   - Scale-conditioning on the hour-1 print was tested and REJECTED: the
-//     near-perfect negative correlation between ln(hour-1) and ln(peak
-//     ratio) across comparables is driven by tiny, sparsely sampled games;
-//     applied to the practice cases it destroys the score (0.25 -> 0.58).
-//     The plain median wins on practice and on leave-one-out over the
-//     comparables. Streams / categories_hourly are null in practice, so the
-//     model works without them and ignores them when present.
+//     the release day) and "weak"-tier comparables (free-to-play /
+//     live-service launches, not a one-day event) are excluded by their
+//     unlock notes. The Grand Theft Auto VI category's own pre-release
+//     history is not a launch curve, so it is excluded by name.
+//   - The hour-1 CHANNEL count was tested as a second kernel feature and
+//     REJECTED (it hurts: 0.188 -> 0.196 on practice). Platform and
+//     release-weekday similarity weightings were tested and REJECTED (both
+//     hurt). A global scale slope (pooled or per-hour OLS on ln hour-1)
+//     was tested and REJECTED (it destroys the score on big launches:
+//     0.25 -> 0.58). Empirical / IQR / SD spreads lose to the fixed
+//     random-walk spread. A per-hour spread fitted from leave-one-out
+//     residuals loses too.
+//   - Streams / categories_hourly are null in practice, so the model works
+//     without them and ignores them when present.
 //
-// Local practice score (4 cases, pinball loss on the log scale): 0.248
-// overall vs the house baseline's 0.387 (p00 0.343, p01 0.147, p02 0.242,
-// p03 0.260). Typical miss ~55%, 90% coverage ~0.91. Practice is no guide
-// to the final, but beating the baseline on practice is the only signal
-// available before submitting.
+// Local practice score (4 cases, pinball loss on the log scale): 0.135
+// overall vs v1's 0.248 and the house baseline's 0.387 (p00 0.123,
+// p01 0.106, p02 0.097, p03 0.215). Leave-one-out over the practice cases
+// (hyperparameters tuned on 3, tested on the 4th): 0.141. Practice is no
+// guide to the final, but it is the only signal available before
+// submitting, and the hyperparameters sit on a flat optimum (0.135-0.138
+// across the neighbouring grid), not a sharp one.
 //
 // Node 22, standard library only, no network, deterministic: no random
 // numbers, no clock reads, same input always writes the same bytes.
@@ -41,58 +64,53 @@ import { join } from 'node:path';
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-/** The spread of an hour's move, in natural-log units per square-root hour. */
-const SIGMA = 0.15;
-/** The median log-ratio curve is shrunk this far toward persistence (0). */
-const SHRINK = 0.9;
+/** Kernel bandwidth on ln(hour-1 viewers). */
+const BANDWIDTH = 0.9;
+/** Small floor weight so the estimate never collapses to one neighbour. */
+const FLOOR_WEIGHT = 0.02;
+/** The fitted peak slope is shrunk this far toward 0 (1 = no shrink). */
+const SLOPE_SHRINK = 0.75;
+/** The predicted log peak ratio never goes below this. */
+const PEAK_FLOOR = -0.6;
+/** Spread of an hour's move, in log units per square-root hour. */
+const SIGMA = 0.09;
+/** Spread multiplier below the median (the early dip is bounded). */
+const DOWN_MULT = 0.7;
+/** Hours below this one use the raw log-ratio median, not peak + shape. */
+const RAW_BELOW_HOUR = 3;
+
+type Levels = number[];
 
 interface KnownRow {
   hour: number;
   viewers: number;
 }
 
-interface ForecastRow {
-  hour: number;
-}
-
-interface ComparableHour {
-  from: string;
-  viewers: number;
-}
-
-interface Comparable {
-  name: string;
-  day_start: string;
-  unlock?: string;
-  hourly: ComparableHour[];
-}
-
-interface Case {
-  levels: number[];
+interface CaseInput {
+  levels: Levels;
   known: KnownRow[];
-  forecast: ForecastRow[];
-  history?: Array<{ viewers: number }>;
-  comparables?: Comparable[];
+  forecast: { hour: number }[];
+  history?: { viewers: number }[];
+  comparables?: {
+    name: string;
+    day_start: string;
+    unlock?: string;
+    hourly: { from: string; viewers: number }[];
+  }[];
 }
 
-/** The standard normal's quantile at each level, in the case's level order. */
-const Z_TABLE: Record<string, number> = {
-  '0.05': -1.6448536269514722,
-  '0.25': -0.6744897501960817,
-  '0.5': 0,
-  '0.75': 0.6744897501960817,
-  '0.95': 1.6448536269514722,
-};
+interface LaunchCurve {
+  peak: number;
+  logV1: number;
+  byHour: Map<number, number>;
+}
 
-/** Inverse standard normal CDF (Acklam's approximation) for any level. */
-function normQuantile(p: number): number {
-  if (p <= 0 || p >= 1) throw new Error(`level ${p} outside (0, 1)`);
-  const key = String(p);
-  if (key in Z_TABLE) return Z_TABLE[key];
-  const a = [-3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2, 1.38357751867269e2, -3.066479806614716e1, 2.506628277459239e0];
-  const b = [-5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2, 6.680131188771972e1, -1.328068155288572e1];
-  const c = [-7.784894002430293e-3, -3.223964580411365e-1, -2.400758277161838e0, -2.549732539343734e0, 4.374664141464968e0, 2.938163982698783e0];
-  const d = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996e0, 3.754408661907416e0];
+/** Standard normal quantiles at the case's levels (Acklam's approximation). */
+function normalQuantile(p: number): number {
+  const a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357751867269, -30.66479806614716, 2.506628277459239];
+  const b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
+  const c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+  const d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
   const plow = 0.02425;
   const phigh = 1 - plow;
   let q: number;
@@ -110,19 +128,25 @@ function normQuantile(p: number): number {
   return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
 }
 
-/** Median of numbers (sorted copy; the mean of the middle two when even). */
-function median(values: number[]): number {
-  const s = [...values].sort((a, b) => a - b);
-  const n = s.length;
-  if (n === 0) return 0;
-  return n % 2 === 1 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+/** Weighted median of (value, weight) pairs; 0 when the weights sum to 0. */
+function weightedMedian(pairs: [number, number][]): number {
+  const total = pairs.reduce((s, [, w]) => s + w, 0);
+  if (total <= 0) return 0;
+  let acc = 0;
+  for (const [v, w] of [...pairs].sort((a, b) => a[0] - b[0])) {
+    acc += w;
+    if (acc >= total / 2) return v;
+  }
+  return [...pairs].sort((a, b) => a[0] - b[0]).at(-1)?.[0] ?? 0;
 }
 
-/** x rounded to 2 decimals (half up). */
-const round2 = (x: number): number => Math.round(x * 100) / 100;
+/** Round to 2 decimals, half up. */
+function round2(x: number): number {
+  return Math.round(x * 100) / 100;
+}
 
 /** A comparable is usable as a launch curve when it is a real launch. */
-function isUsableComparable(c: Comparable): boolean {
+function usableComparable(c: NonNullable<CaseInput['comparables']>[number]): boolean {
   if (c.name.toLowerCase().includes('grand theft auto vi')) return false;
   const unlock = (c.unlock ?? '').toLowerCase();
   if (unlock.includes('early access')) return false;
@@ -132,13 +156,12 @@ function isUsableComparable(c: Comparable): boolean {
 
 /**
  * One comparable's launch-day curve in log space: ln(viewers_h / viewers_1)
- * for h = 2..24, keyed by the hour's offset from the comparable's own
- * day_start. Hours with no point (or a non-positive count) are skipped.
+ * for h = 2..24, plus its peak log-ratio and its ln(hour-1 viewers).
  */
-function logRatioCurve(c: Comparable): Map<number, number> {
+function toLaunchCurve(c: NonNullable<CaseInput['comparables']>[number]): LaunchCurve | null {
   const dayStart = Date.parse(c.day_start);
+  if (Number.isNaN(dayStart)) return null;
   const byHour = new Map<number, number>();
-  if (Number.isNaN(dayStart)) return byHour;
   for (const pt of c.hourly ?? []) {
     const t = Date.parse(pt.from);
     if (Number.isNaN(t) || !(pt.viewers > 0)) continue;
@@ -146,20 +169,28 @@ function logRatioCurve(c: Comparable): Map<number, number> {
     if (h >= 1 && h <= 24 && !byHour.has(h)) byHour.set(h, pt.viewers);
   }
   const v1 = byHour.get(1);
-  if (v1 === undefined) return new Map();
+  if (v1 === undefined) return null;
   const curve = new Map<number, number>();
   for (const [h, v] of byHour) {
     if (h >= 2) curve.set(h, Math.log(v / v1));
   }
-  return curve;
+  if (curve.size === 0) return null;
+  return { peak: Math.max(...curve.values()), logV1: Math.log(v1), byHour: curve };
+}
+
+/** Gaussian kernel weight of a comparable for a case with this ln(hour-1). */
+function kernelWeight(logV1: number, targetLogV1: number): number {
+  const d = (logV1 - targetLogV1) / BANDWIDTH;
+  return Math.exp(-0.5 * d * d) + FLOOR_WEIGHT;
 }
 
 /**
- * The forecast of one case: per hour, the shrunk median log-ratio across
- * the usable comparables, widened by the random-walk spread. Falls back to
- * persistence (median 0) when no comparable supplies a curve.
+ * The forecast of one case: the predicted peak from the local-linear fit,
+ * the per-hour shape as the kernel-weighted median of (curve - peak), the
+ * raw median for the earliest hours, widened by the asymmetric
+ * random-walk spread.
  */
-function forecastCase(c: Case): { hour: number; q: number[] }[] {
+function forecastCase(c: CaseInput): { hour: number; q: number[] }[] {
   const first = c.known.find((k) => k.hour === 1);
   let p1 = first !== undefined && first.viewers > 0 ? first.viewers : 0;
   if (p1 <= 0 && c.history !== undefined && c.history.length > 0) {
@@ -167,32 +198,65 @@ function forecastCase(c: Case): { hour: number; q: number[] }[] {
     if (last.viewers > 0) p1 = last.viewers;
   }
   p1 = Math.max(1, p1);
+  const logP1 = Math.log(p1);
 
   const levels = c.levels.length > 0 ? c.levels : [0.05, 0.25, 0.5, 0.75, 0.95];
-  const z = levels.map((t) => normQuantile(t));
+  const z = levels.map((t) => normalQuantile(t));
 
-  const curves: Map<number, number>[] = [];
+  const curves: LaunchCurve[] = [];
   for (const comp of c.comparables ?? []) {
-    if (!isUsableComparable(comp)) continue;
-    const curve = logRatioCurve(comp);
-    if (curve.size > 0) curves.push(curve);
+    if (!usableComparable(comp)) continue;
+    const curve = toLaunchCurve(comp);
+    if (curve !== null) curves.push(curve);
+  }
+
+  // --- predicted log peak ratio: kernel-weighted local-linear fit of peak
+  // on ln(hour-1 viewers), slope clamped to [-1.5, 0] and shrunk. ---
+  let peak = 0;
+  if (curves.length > 0) {
+    const ws = curves.map((lc) => kernelWeight(lc.logV1, logP1));
+    const sw = ws.reduce((s, w) => s + w, 0);
+    const meanX = curves.reduce((s, lc, i) => s + ws[i] * lc.logV1, 0) / sw;
+    const meanY = curves.reduce((s, lc, i) => s + ws[i] * lc.peak, 0) / sw;
+    const varX = curves.reduce((s, lc, i) => s + ws[i] * (lc.logV1 - meanX) ** 2, 0) / sw;
+    let slope = 0;
+    if (varX > 1e-9) {
+      slope = curves.reduce((s, lc, i) => s + ws[i] * (lc.logV1 - meanX) * (lc.peak - meanY), 0) / sw / varX;
+    }
+    slope = Math.max(-1.5, Math.min(0, slope)) * SLOPE_SHRINK;
+    peak = Math.max(PEAK_FLOOR, meanY + slope * (logP1 - meanX));
   }
 
   return c.forecast.map(({ hour }) => {
-    const ratios: number[] = [];
-    for (const curve of curves) {
-      const r = curve.get(hour);
-      if (r !== undefined && Number.isFinite(r)) ratios.push(r);
+    let centre: number;
+    let support = 0;
+    if (hour < RAW_BELOW_HOUR) {
+      // The early dip is nearly the same for every launch: raw median.
+      const pairs: [number, number][] = [];
+      for (const lc of curves) {
+        const r = lc.byHour.get(hour);
+        if (r !== undefined && Number.isFinite(r)) pairs.push([r, kernelWeight(lc.logV1, logP1)]);
+      }
+      support = pairs.length;
+      centre = weightedMedian(pairs);
+    } else {
+      // Peak + shape: the shape is far more stable than the raw curve.
+      const pairs: [number, number][] = [];
+      for (const lc of curves) {
+        const r = lc.byHour.get(hour);
+        if (r !== undefined && Number.isFinite(r)) pairs.push([r - lc.peak, kernelWeight(lc.logV1, logP1)]);
+      }
+      support = pairs.length;
+      centre = peak + weightedMedian(pairs);
     }
-    // A median over very few curves is noise, not signal: with fewer than
-    // five comparables supplying this hour, blend the median toward
-    // persistence in proportion. In the practice cases every hour has all
-    // curves, so this never bites there; it only guards the final if the
-    // case's comparables ever arrive sparse.
-    let m = median(ratios) * SHRINK;
-    if (ratios.length > 0 && ratios.length < 5) m *= ratios.length / 5;
+    // A centre over very few curves is noise, not signal: with fewer than
+    // three comparables supplying this hour, blend it toward persistence
+    // in proportion. In the practice cases every hour has all curves, so
+    // this never bites there; it only guards the final if the case's
+    // comparables ever arrive sparse.
+    if (support > 0 && support < 3) centre *= support / 3;
     const spread = SIGMA * Math.sqrt(Math.max(0, hour - 1));
-    let q = z.map((zi) => round2(p1 * Math.exp(m + zi * spread)));
+    let q = z.map((zi) => round2(p1 * Math.exp(centre + zi * spread * (zi < 0 ? DOWN_MULT : 1))));
     q = q.map((v) => Math.min(1e9, Math.max(1, v)));
     for (let i = 1; i < q.length; i++) q[i] = Math.max(q[i], q[i - 1]);
     return { hour, q };
@@ -204,7 +268,7 @@ mkdirSync(OUTPUT_DIR, { recursive: true });
 const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
 for (const file of inputs) {
   const id = file.slice(0, -'.in'.length);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
+  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as CaseInput;
   const hours = forecastCase(c);
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ hours })}\n`);
 }
